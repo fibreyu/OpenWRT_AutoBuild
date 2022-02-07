@@ -1,0 +1,210 @@
+#
+# https://github.com/fibreyu/OpenWRT_AutoBuild
+# Description: Build coolsnowwolf lede using GitHub Actions
+#
+
+name: Build LEDE
+
+on:
+  push:
+    branches: 
+      - build
+  # schedule:
+  #   - cron: 0 20 * * *
+  release:
+    types: [published, released]
+
+
+env:
+  REPO_URL: https://github.com/coolsnowwolf/lede
+  REPO_BRANCH: master
+  FEEDS_CONF: config/x86.feeds.conf.default
+  CONFIG_FILE: config/x86_64_lede_diff.config
+  UPLOAD_BIN_DIR: true
+  UPLOAD_FIRMWARE: false
+  UPLOAD_RELEASE: false
+  TZ: Asia/Shanghai
+
+jobs:
+  build_lede:
+    runs-on: ubuntu-latest
+
+    steps:
+    # 克隆本地仓库
+    - name: Checkout
+      uses: actions/checkout@v2
+      with:
+          ref: build
+    # 初始化环境
+    - name: Initialization environment
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        echo current user is: $(whoami)
+        echo current group is: $(groups)
+        set +e
+        docker rmi `docker images -q`
+        # 删除文件
+        sudo rm -rf \
+          /usr/share/dotnet \
+          /etc/mysql \
+          /etc/php \
+          /etc/apt/sources.list.d/* \
+          /usr/local/lib/android \
+          /opt/ghc
+        # 删除软件
+        sudo -E apt-get -y purge \
+          azure-cli \
+          ghc* \
+          zulu* \
+          hhvm \
+          llvm* \
+          firefox \
+          google* \
+          dotnet* \
+          powershell \
+          openjdk* \
+          mysql* \
+          php* \
+          mongodb* \
+          moby* \
+          snapd*
+        # 更新库
+        sudo -E apt-get -qq update
+        sudo -E apt-get -yqq install build-essential asciidoc binutils bzip2 gawk gettext git libncurses5-dev libz-dev patch python3 python2.7 unzip zlib1g-dev lib32gcc1 libc6-dev-i386 subversion flex uglifyjs git-core gcc-multilib p7zip p7zip-full msmtp libssl-dev texinfo libglib2.0-dev xmlto qemu-utils upx libelf-dev autoconf automake libtool autopoint device-tree-compiler g++-multilib antlr3 gperf wget curl swig rsync
+        sudo -E apt-get -yqq autoremove --purge
+        sudo -E apt-get -qq clean
+        # 设置时区
+        sudo timedatectl set-timezone "$TZ"
+
+    # 拉取代码
+    - name: Clone source code
+      run: |
+        df -hT
+        git clone --depth 1 $REPO_URL -b $REPO_BRANCH lede
+    
+    # 加入第三方插件
+    - name: Load custom feeds
+      run: |
+        [ -e $FEEDS_CONF ] && cp -f $FEEDS_CONF ./lede/feeds.conf.default
+        # 给脚本添加执行权限
+        chmod a+x ${GITHUB_WORKSPACE}/scripts/*.sh
+        # 修改换行为linux格式
+        sed -i "s/\r//g" ${GITHUB_WORKSPACE}/scripts/*
+        sed -i "s/^M//g" ${GITHUB_WORKSPACE}/scripts/*
+        cd lede
+        # 执行脚本添加自定义包
+        # run-parts --regex='^package.*sh$' ${GITHUB_WORKSPACE}/scripts
+        find ${GITHUB_WORKSPACE}/scripts -maxdepth 1 -type f -executable -name 'package_*.sh' -exec {} \;
+    
+    # 更新插件
+    - name: Update & Install feeds
+      working-directory: ./lede
+      run: |
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+
+    # 修改基本配置信息
+    - name: Set Base-file
+      working-directory: ./lede
+      run: |
+        chmod -R 775 ${GITHUB_WORKSPACE}/files
+        # 修改基本配置
+        # run-parts --regex='^firmware.*sh$' ${GITHUB_WORKSPACE}/scripts
+        find ${GITHUB_WORKSPACE}/scripts -maxdepth 1 -type f -executable -name 'firmware_*.sh' -exec {} \;
+
+    # 更新编译配置文件.config
+    - name: Configuration Customization - Build_x86_64
+      run: |
+        [ -e $CONFIG_FILE ] && cp -f $CONFIG_FILE lede/.config
+        cd lede
+        make defconfig
+
+    # 下载包
+    - name: Download package
+      working-directory: ./lede
+      id: package
+      run: |
+        make download -j$(nproc) V=s || make download -j8 V=s
+        # 删除没有下载完全的包文件
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
+    
+    # 编译固件
+    - name: Compile firmware
+      working-directory: ./lede
+      id: compile
+      run: |
+        echo -e "$(nproc) thread compile"
+        make -j$(($(nproc) + 1)) V=s || make -j1 V=s || make -j1 V=s
+        # make -j1 V=s
+        echo "::set-output name=status::success"
+        echo "BUILD_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
+    
+    # 检查空间
+    - name: Check space usage
+      if: (!cancelled())
+      run: df -hT
+
+    # 上传编译结果bin目录
+    - name: Upload bin directory
+      uses: actions/upload-artifact@master
+      if: env.UPLOAD_BIN_DIR == 'true' && steps.compile.outputs.status == 'success'
+      with:
+        name: lede_bin_${{ env.BUILD_DATE }}
+        path: lede/bin
+
+    # 打包固件
+    - name: Organize files
+      id: organize
+      if: env.UPLOAD_FIRMWARE == 'true' && !cancelled() || env.UPLOAD_RELEASE  == 'true' && !cancelled() 
+      run: |
+        cd lede/bin/targets/*/*
+        rm -rf packages
+        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+        zip x86_64_lede.zip ./*
+        echo "::set-output name=status::success"
+    
+    # 上传固件包
+    - name: Upload firmware zip
+      uses: actions/upload-artifact@main
+      if: steps.organize.outputs.status == 'success' && !cancelled()
+      with:
+        name: lede_firmware${{ env.BUILD_DATE }}
+        path: ${{ env.FIRMWARE }}/x86_64_lede.zip
+
+    # 创建发行版tag
+    - name: Generate release tag
+      id: release_tag
+      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      run: |
+        release_tag="x86_64_lede_$(date +"%Y%m%d%H%M")"
+        echo "##[set-output name=release_tag;]$release_tag"
+        echo "::set-output name=release_tag::$release_tag"
+        echo "::set-output name=status::success"
+
+    # 创建发行版
+    - name: Release
+      uses: softprops/action-gh-release@v1
+      if: steps.release_tag.outputs.status == 'success' && steps.organize.outputs.status == 'success' && !cancelled()
+      with:
+        files: ${{ env.FIRMWARE }}/x86_64_lede.zip
+        prerelease: false
+        tag_name: ${{ steps.release_tag.outputs.release_tag }}
+
+    # 删除工作流
+  # - name: Delete workflow runs
+  #   uses: GitRML/delete-workflow-runs@main
+  #   with:
+  #     retain_days: 1
+  #     keep_minimum_runs: 3
+
+    # 删除旧的发行版
+  # - name: Remove old Releases
+  #   uses: dev-drprasad/delete-older-releases@v0.1.0
+  #   if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+  #   with:
+  #     keep_latest: 3
+  #     delete_tags: true
+  #   env:
+  #     GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
